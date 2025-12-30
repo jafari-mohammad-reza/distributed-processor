@@ -1,0 +1,1 @@
+this is a practical project to distribute a large data set into multiple partitions like kafka and apply certain given function to each of those partitions and then merge them into on file again the output migh be a bson and the input can be a sql
