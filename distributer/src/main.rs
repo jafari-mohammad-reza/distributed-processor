@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{env, process, sync::Arc};
+use tokio::time::{self, Duration};
 
 use crate::producer::Producer;
 
@@ -35,6 +36,16 @@ async fn main() -> Result<(), sqlx::Error> {
         tokio::spawn(async move {
             if let Err(e) = producer.listen_processor().await {
                 eprintln!("Error in listen_processor: {}", e);
+            }
+        });
+    }
+    {
+        let producer = producer.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                producer.heartbeat_processors().await;
             }
         });
     }

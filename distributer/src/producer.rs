@@ -1,6 +1,7 @@
 use crate::Netflow;
 use lz4_flex::compress_prepend_size;
 use std::io::{Error, Read};
+use std::os::linux::net::TcpStreamExt;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -21,7 +22,7 @@ impl Producer {
         let listener = TcpListener::bind("0.0.0.0:8080").await?;
         println!("Listening on port 8080...");
 
-        let processors = Arc::clone(&self.processors);
+        let processors: Arc<Mutex<Vec<String>>> = Arc::clone(&self.processors);
 
         loop {
             let (mut socket, addr) = listener.accept().await?;
@@ -65,7 +66,22 @@ impl Producer {
         }
     }
 
-    pub fn heartbeat_processors(&self) {}
+    pub async fn heartbeat_processors(&self) -> Result<(), Error> {
+        let processors: Arc<Mutex<Vec<String>>> = Arc::clone(&self.processors);
+        let mut procs = processors.lock().unwrap();
+        for processor in procs.iter() {
+            let mut stream = TcpStream::connect(processor).await?;
+            stream.write_all("health-check".as_bytes()).await?;
+            let mut buf = vec![0; 1024];
+            let n = stream.read(&mut buf).await?;
+            let resp = String::from_utf8_lossy(&buf[..n]).to_string();
+            println!("Received: {:?}", resp);
+            if resp != "healthy" {
+                procs.retain(|ip| ip != processor);
+            }
+        }
+        Ok(())
+    }
 
     pub async fn produce(&self, items: Vec<Netflow>) -> Result<(), Error> {
         let encoded: Vec<u8> = bincode2::serialize(&items).expect("failed to encode items");
