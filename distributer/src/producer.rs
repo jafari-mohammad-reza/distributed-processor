@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 pub struct Producer {
     processors: Arc<Mutex<Vec<String>>>,
     curr_index: Arc<Mutex<usize>>,
+    pub ready_to_produce: Arc<Mutex<bool>>,
 }
 
 impl Producer {
@@ -15,6 +16,7 @@ impl Producer {
         Self {
             processors: Arc::new(Mutex::new(Vec::new())),
             curr_index: Arc::new(Mutex::new(0)),
+            ready_to_produce: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -67,19 +69,42 @@ impl Producer {
     }
 
     pub async fn heartbeat_processors(&self) -> Result<(), Error> {
-        let processors: Arc<Mutex<Vec<String>>> = Arc::clone(&self.processors);
-        let mut procs = processors.lock().unwrap();
-        for processor in procs.iter() {
-            let mut stream = TcpStream::connect(processor).await?;
-            stream.write_all("health-check".as_bytes()).await?;
-            let mut buf = vec![0; 1024];
-            let n = stream.read(&mut buf).await?;
-            let resp = String::from_utf8_lossy(&buf[..n]).to_string();
-            println!("Received: {:?}", resp);
-            if resp != "healthy" {
-                procs.retain(|ip| ip != processor);
+        let processors_snapshot: Vec<String> = {
+            let procs = self.processors.lock().unwrap();
+            procs.clone()
+        };
+
+        let mut unhealthy = Vec::new();
+
+        for processor in &processors_snapshot {
+            match TcpStream::connect(processor).await {
+                Ok(mut stream) => {
+                    stream.write_all(b"health-check").await?;
+                    let mut buf = vec![0; 1024];
+                    let n = stream.read(&mut buf).await?;
+                    let resp = String::from_utf8_lossy(&buf[..n]);
+
+                    if resp != "healthy" {
+                        unhealthy.push(processor.clone());
+                    }
+                }
+                Err(_) => {
+                    unhealthy.push(processor.clone());
+                }
             }
         }
+
+        if !unhealthy.is_empty() {
+            let mut procs = self.processors.lock().unwrap();
+            procs.retain(|ip| !unhealthy.contains(ip));
+        }
+        let mut ready_to_produce = self.ready_to_produce.lock().unwrap();
+        if !self.processors.lock().unwrap().is_empty() {
+            *ready_to_produce = true;
+        } else {
+            *ready_to_produce = false;
+        }
+
         Ok(())
     }
 
