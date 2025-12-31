@@ -7,7 +7,6 @@ use sqlx::{Pool, Postgres, postgres::PgPoolOptions};
 use crate::Netflow;
 
 pub struct DB {
-    db_url: String,
     pool: Pool<Postgres>,
 }
 
@@ -18,10 +17,7 @@ impl DB {
             .connect(&db_url)
             .await?;
 
-        Ok(Self {
-            db_url: db_url,
-            pool,
-        })
+        Ok(Self { pool })
     }
     pub async fn create_table(&self) -> Result<(), sqlx::Error> {
         match sqlx::query(
@@ -45,7 +41,7 @@ impl DB {
         .execute(&self.pool)
         .await
         {
-            Ok(res) => Ok(()),
+            Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
     }

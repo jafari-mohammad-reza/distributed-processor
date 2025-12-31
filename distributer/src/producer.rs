@@ -1,14 +1,14 @@
 use crate::Netflow;
 use lz4_flex::compress_prepend_size;
-use std::io::{Error, Read};
-use std::os::linux::net::TcpStreamExt;
+use std::io::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 pub struct Producer {
     processors: Arc<Mutex<Vec<String>>>,
     curr_index: Arc<Mutex<usize>>,
-    pub ready_to_produce: Arc<Mutex<bool>>,
+    pub ready_to_produce: Arc<AtomicBool>,
 }
 
 impl Producer {
@@ -16,12 +16,12 @@ impl Producer {
         Self {
             processors: Arc::new(Mutex::new(Vec::new())),
             curr_index: Arc::new(Mutex::new(0)),
-            ready_to_produce: Arc::new(Mutex::new(false)),
+            ready_to_produce: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub async fn listen_processor(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind("0.0.0.0:8080").await?;
+        let listener: TcpListener = TcpListener::bind("0.0.0.0:8080").await?;
         println!("Listening on port 8080...");
 
         let processors: Arc<Mutex<Vec<String>>> = Arc::clone(&self.processors);
@@ -40,15 +40,19 @@ impl Producer {
                         Ok(0) => break,
                         Ok(n) => {
                             let cmd = String::from_utf8_lossy(&buf[..n]).to_string();
-
-                            if cmd == "connect" {
-                                let mut procs = processors.lock().unwrap();
-                                if !procs.contains(&addr.ip().to_string()) {
-                                    procs.push(addr.ip().to_string());
+                            println!("received command: {}", cmd);
+                            if cmd.contains("connect") {
+                                if let Some(port) = cmd.strip_prefix("connect ") {
+                                    let node_addr = format!("{}:{}", addr.ip(), port);
+                                    println!("{} registered", node_addr);
+                                    let mut procs = processors.lock().unwrap();
+                                    if !procs.contains(&node_addr) {
+                                        procs.push(node_addr);
+                                    }
                                 }
                             } else if cmd == "disconnect" {
                                 let mut procs = processors.lock().unwrap();
-                                procs.retain(|ip| ip != &addr.ip().to_string());
+                                procs.retain(|ip: &String| ip != &addr.ip().to_string());
                             } else {
                                 if let Err(e) = socket.write_all(b"invalid command").await {
                                     eprintln!("Failed to write to socket: {}", e);
@@ -98,12 +102,10 @@ impl Producer {
             let mut procs = self.processors.lock().unwrap();
             procs.retain(|ip| !unhealthy.contains(ip));
         }
-        let mut ready_to_produce = self.ready_to_produce.lock().unwrap();
-        if !self.processors.lock().unwrap().is_empty() {
-            *ready_to_produce = true;
-        } else {
-            *ready_to_produce = false;
-        }
+        self.ready_to_produce.store(
+            !self.processors.lock().unwrap().is_empty(),
+            Ordering::Release,
+        );
 
         Ok(())
     }
@@ -113,8 +115,13 @@ impl Producer {
         let compressed: Vec<u8> = compress_prepend_size(&encoded);
         let len = (compressed.len() as u32).to_be_bytes();
 
-        let processors = self.processors.lock().unwrap();
-        if processors.is_empty() {
+        let processors_snapshot = {
+            let procs = self.processors.lock().unwrap();
+            procs.clone()
+        };
+        if processors_snapshot.is_empty() {
+            self.ready_to_produce.store(false, Ordering::Release);
+
             return Err(Error::new(
                 std::io::ErrorKind::Other,
                 "no processors available",
@@ -122,10 +129,11 @@ impl Producer {
         }
 
         let mut index_lock = self.curr_index.lock().unwrap();
-        let processor_addr = &processors[*index_lock];
-        *index_lock = (*index_lock + 1) % processors.len();
-
+        let processor_addr = &processors_snapshot[*index_lock];
+        *index_lock = (*index_lock + 1) % processors_snapshot.len();
+        println!("producing to: {}", processor_addr);
         let mut stream = TcpStream::connect(processor_addr).await?;
+        stream.write_all(b"chunk").await?;
         stream.write_all(&len).await?;
         stream.write_all(&compressed).await?;
         Ok(())

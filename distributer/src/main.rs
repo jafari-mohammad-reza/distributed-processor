@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{env, process, sync::Arc};
-use tokio::{
-    sync::futures,
-    time::{self, Duration},
+use std::{
+    env, process,
+    sync::{Arc, atomic::Ordering},
 };
+use tokio::time::{self, Duration};
 
 use crate::producer::Producer;
 
@@ -48,7 +48,6 @@ async fn main() -> Result<(), sqlx::Error> {
             let mut interval = time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
-                println!("heartbeat");
                 if let Err(err) = producer.heartbeat_processors().await {
                     println!("failed to run heartbeat {}", err)
                 };
@@ -80,17 +79,19 @@ async fn main() -> Result<(), sqlx::Error> {
             }
         }
     }
-    let ready_to_produce = {
-        let ready_to_produce = producer.ready_to_produce.lock().unwrap();
-        *ready_to_produce
-    };
-    if ready_to_produce {
+    let mut interval = time::interval(Duration::from_secs(5));
+    let db = Arc::new(db);
+    loop {
+        interval.tick().await;
+        if !producer.ready_to_produce.load(Ordering::Acquire) {
+            continue;
+        }
+
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         let chunk_size = ROWS_COUNT / cores;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<Netflow>>(chunk_size);
-        let db = Arc::new(db);
         for i in 0..cores {
             let db = db.clone();
             let tx = tx.clone();
@@ -104,12 +105,13 @@ async fn main() -> Result<(), sqlx::Error> {
 
         drop(tx);
         while let Some(items) = rx.recv().await {
+            if !producer.ready_to_produce.load(Ordering::Acquire) {
+                continue;
+            }
             match producer.produce(items).await {
                 Ok(_) => println!("chunk produced successfully"),
                 Err(err) => println!("failed to produce chunk {}", err),
             }
         }
     }
-    tokio::signal::ctrl_c().await.unwrap();
-    Ok(())
 }
